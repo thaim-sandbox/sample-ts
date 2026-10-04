@@ -44,45 +44,90 @@ test('ルートへのアクセスをログ出力する', async () => {
   }
 });
 
-// 処理中リクエストに SIGTERM を送り、完了を待たずに 503 を返して終了することを検証する
-async function assertCancelledOnSigterm(path: string, logPrefix: string, cancelLog: string): Promise<void> {
+async function requestThenSigterm(path: string, logPrefix: string, ms: number) {
   const { child, getOutput } = startApp();
   const url = await waitForUrl(getOutput);
 
   const startedAt = Date.now();
-  const resPromise = fetch(`${url}${path}?ms=10000`);
+  const resPromise = fetch(`${url}${path}?ms=${ms}`);
   await waitFor(() => getOutput().includes(`${logPrefix} start`), getOutput);
 
   child.kill('SIGTERM');
   const res = await resPromise;
   const [code, signal] = (await once(child, 'exit')) as [number | null, NodeJS.Signals | null];
+  return { res, output: getOutput(), elapsedMs: Date.now() - startedAt, code, signal };
+}
+
+// 処理中リクエストに SIGTERM を送り、完了を待たずに 503 を返して終了することを検証する
+async function assertCancelledOnSigterm(path: string, logPrefix: string, cancelLog: RegExp): Promise<void> {
+  const ms = 10000;
+  const { res, output, elapsedMs, code, signal } = await requestThenSigterm(path, logPrefix, ms);
 
   assert.equal(res.status, 503);
-  assert.ok(Date.now() - startedAt < 10000, '処理が完了するまで待たずに応答する');
-  assert.ok(getOutput().includes(cancelLog), getOutput());
-  assert.ok(!getOutput().includes(`${logPrefix} end`), getOutput());
+  assert.ok(elapsedMs < ms, '処理が完了するまで待たずに応答する');
+  assert.match(output, cancelLog);
+  assert.ok(!output.includes(`${logPrefix} end`), output);
   assert.equal(code, null);
   assert.equal(signal, 'SIGTERM');
 }
 
-test('SIGTERM で cancellable-sleep を中断し、503 を返して終了する', () =>
-  assertCancelledOnSigterm('/cancellable-sleep', 'cancellable sleep', 'cancellable sleep cancelled by SIGTERM'));
-
-test('cpu-heavy は Worker スレッドで処理を完了して応答する', async () => {
+async function assertCompletes(path: string): Promise<void> {
   const { child, getOutput } = startApp();
   try {
     const url = await waitForUrl(getOutput);
 
-    const res = await fetch(`${url}/cpu-heavy?ms=100`);
+    const res = await fetch(`${url}${path}?ms=100`);
     assert.equal(res.status, 200);
     assert.match(await res.text(), /^computed \d+ iterations in 100ms$/);
   } finally {
     child.kill('SIGKILL');
   }
-});
+}
+
+test('SIGTERM で cancellable-sleep を中断し、503 を返して終了する', () =>
+  assertCancelledOnSigterm('/cancellable-sleep', 'cancellable sleep', /cancellable sleep cancelled by SIGTERM/));
+
+test('cpu-heavy は Worker スレッドで処理を完了して応答する', () => assertCompletes('/cpu-heavy'));
 
 test('SIGTERM で cpu-heavy の Worker を強制終了し、503 を返して終了する', () =>
-  assertCancelledOnSigterm('/cpu-heavy', 'cpu heavy', 'cpu heavy cancelled by SIGTERM (worker terminated)'));
+  assertCancelledOnSigterm('/cpu-heavy', 'cpu heavy', /cpu heavy cancelled by SIGTERM \(worker terminated\)/));
+
+test('cpu-heavy-cooperative は Worker スレッドで処理を完了して応答する', () =>
+  assertCompletes('/cpu-heavy-cooperative'));
+
+test('SIGTERM で cpu-heavy-cooperative の Worker が後始末して終わり、503 を返して終了する', () =>
+  assertCancelledOnSigterm(
+    '/cpu-heavy-cooperative',
+    'cpu heavy cooperative',
+    /cpu heavy cooperative cancelled by SIGTERM after \d+ms \(\d+ iterations, cleaned up by worker\)/,
+  ));
+
+test('cpu-heavy-chunked はメインスレッドで処理を完了して応答する', () => assertCompletes('/cpu-heavy-chunked'));
+
+test('SIGTERM で cpu-heavy-chunked を区切りで中断し、途中経過をログ出力して 503 を返して終了する', () =>
+  assertCancelledOnSigterm(
+    '/cpu-heavy-chunked',
+    'cpu heavy chunked',
+    /cpu heavy chunked cancelled by SIGTERM after \d+ms \(\d+ iterations\)/,
+  ));
+
+test('cpu-heavy-blocking は SIGTERM を受けても処理を完了して 200 を返し、その後に終了する', async () => {
+  const ms = 1000;
+  const { res, output, elapsedMs, code, signal } = await requestThenSigterm(
+    '/cpu-heavy-blocking',
+    'cpu heavy blocking',
+    ms,
+  );
+
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), new RegExp(`^computed \\d+ iterations in ${ms}ms$`));
+  assert.ok(elapsedMs >= ms, '処理の完了まで応答しない');
+  const endAt = output.indexOf('cpu heavy blocking end');
+  assert.ok(endAt >= 0, output);
+  assert.ok(endAt < output.indexOf('onModuleDestroy'), 'ループ完了後に終了処理を始める');
+  assert.equal(code, null);
+  assert.equal(signal, 'SIGTERM');
+});
 
 test('SIGTERM でライフサイクルフックが順に呼ばれ、シグナルにより終了する', async () => {
   const { child, getOutput } = startApp();

@@ -10,10 +10,11 @@ npm run build
 npm start                              # PORT 環境変数で待ち受けポートを変更できる
 curl 'localhost:3000/sleep?ms=5000'    # 処理中リクエストがある状態を作る（完了を待ってから終了する）
 curl 'localhost:3000/cancellable-sleep?ms=5000'  # SIGTERM で中断して 503 を返す
+curl 'localhost:3000/cpu-heavy?ms=5000'          # CPU 処理を Worker スレッドで実行し、SIGTERM で Worker を強制終了して 503 を返す
 kill -TERM <pid>                       # 起動ログに表示される pid に送る
 ```
 
-`npm test` は起動したアプリに SIGTERM を送り、ライフサイクルフックの呼び出し順、`/cancellable-sleep` の中断、終了状態を検証する。
+`npm test` は起動したアプリに SIGTERM を送り、ライフサイクルフックの呼び出し順、`/cancellable-sleep` と `/cpu-heavy` の中断、終了状態を検証する。
 
 ## 実行例
 
@@ -61,11 +62,11 @@ Terminated
 SIGTERM を受けると、Nest は次の順に終了処理を行う（`@nestjs/core` の `NestApplicationContext.runShutdownSequence`）。
 
 1. `onModuleDestroy` を呼ぶ
-2. `beforeApplicationShutdown` を呼ぶ。`ShutdownSignal` がここで `AbortController` を中断し、処理中の `/cancellable-sleep` はすべて待機を打ち切って 503 を返す
+2. `beforeApplicationShutdown` を呼ぶ。`ShutdownSignal` がここで `AbortController` を中断する。処理中の `/cancellable-sleep` は待機を打ち切り、`/cpu-heavy` は Worker を強制終了して、それぞれ 503 を返す
 3. HTTP サーバーを閉じる。処理中のリクエストがあれば完了を待つ
 4. `onApplicationShutdown` を呼ぶ
 5. 自身のシグナルハンドラを外し、受け取ったシグナルを自プロセスに送り直す
 
-中断ログが `beforeApplicationShutdown` の後かつ `onApplicationShutdown` の前に出ていることから、3 でサーバーを閉じる前に 2 件とも応答を返したとわかる。最後の `Terminated` は、プロセスが SIGTERM で終了したことを示すシェルの表示で、5 によるもの。終了コードは 143（128 + 15）になる。
+中断ログが `beforeApplicationShutdown` の後かつ `onApplicationShutdown` の前に出ていることから、3 でサーバーを閉じる前に 2 件とも応答を返したとわかる。最後の `Terminated` は、プロセスが SIGTERM で終了したことを示すシェルの表示で、5 で送り直したシグナルによる。終了コードは 143（128 + 15）になる。
 
 `/sleep` は中断を受け付けないため、3 で sleep の完了を待ってから終了する。

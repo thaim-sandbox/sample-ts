@@ -7,14 +7,17 @@ NestJS アプリケーションが SIGTERM をどのように処理するかを�
 ```sh
 npm install
 npm run build
-npm start                              # PORT 環境変数で待ち受けポートを変更できる
-curl 'localhost:3000/sleep?ms=5000'    # 処理中リクエストがある状態を作る（完了を待ってから終了する）
-curl 'localhost:3000/cancellable-sleep?ms=5000'  # SIGTERM で中断して 503 を返す
-curl 'localhost:3000/cpu-heavy?ms=5000'          # CPU 処理を Worker スレッドで実行し、SIGTERM で Worker を強制終了して 503 を返す
-kill -TERM <pid>                       # 起動ログに表示される pid に送る
+npm start                                           # PORT 環境変数で待ち受けポートを変更できる
+curl 'localhost:3000/sleep?ms=5000'                 # 処理中リクエストがある状態を作る（完了を待ってから終了する）
+curl 'localhost:3000/cancellable-sleep?ms=5000'     # SIGTERM で中断して 503 を返す
+curl 'localhost:3000/cpu-heavy?ms=5000'             # CPU 処理を Worker スレッドで実行し、SIGTERM で Worker を強制終了して 503 を返す
+curl 'localhost:3000/cpu-heavy-cooperative?ms=5000' # CPU 処理を Worker スレッドで実行し、SIGTERM で Worker に中断を通知して後始末させてから 503 を返す
+curl 'localhost:3000/cpu-heavy-chunked?ms=5000'     # CPU 処理を小分けにしてメインスレッドで実行し、区切りで SIGTERM による中断を受け付けて 503 を返す
+curl 'localhost:3000/cpu-heavy-blocking?ms=5000'    # CPU 処理をメインスレッドで実行する。SIGTERM を受けても処理の完了を待ってから終了する
+kill -TERM <pid>                                    # 起動ログに表示される pid に送る
 ```
 
-`npm test` は起動したアプリに SIGTERM を送り、ライフサイクルフックの呼び出し順、`/cancellable-sleep` と `/cpu-heavy` の中断、終了状態を検証する。
+`npm test` は起動したアプリに SIGTERM を送り、ライフサイクルフックの呼び出し順、`/cancellable-sleep`・`/cpu-heavy`・`/cpu-heavy-cooperative`・`/cpu-heavy-chunked` の中断、`/cpu-heavy-blocking` が中断できないこと、終了状態を検証する。
 
 ## 実行例
 
@@ -62,7 +65,11 @@ Terminated
 SIGTERM を受けると、Nest は次の順に終了処理を行う（`@nestjs/core` の `NestApplicationContext.runShutdownSequence`）。
 
 1. `onModuleDestroy` を呼ぶ
-2. `beforeApplicationShutdown` を呼ぶ。`ShutdownSignal` がここで `AbortController` を中断する。処理中の `/cancellable-sleep` は待機を打ち切り、`/cpu-heavy` は Worker を強制終了して、それぞれ 503 を返す
+2. `beforeApplicationShutdown` を呼ぶ。`ShutdownSignal` がここで `AbortController` を中断し、処理中の次のエンドポイントは 503 を返す
+    - `/cancellable-sleep`: 待機を打ち切る
+    - `/cpu-heavy`: Worker を強制終了する
+    - `/cpu-heavy-cooperative`: Worker が後始末をして終わる
+    - `/cpu-heavy-chunked`: 次の区切りで処理を止める
 3. HTTP サーバーを閉じる。処理中のリクエストがあれば完了を待つ
 4. `onApplicationShutdown` を呼ぶ
 5. 自身のシグナルハンドラを外し、受け取ったシグナルを自プロセスに送り直す
@@ -70,3 +77,7 @@ SIGTERM を受けると、Nest は次の順に終了処理を行う（`@nestjs/c
 中断ログが `beforeApplicationShutdown` の後かつ `onApplicationShutdown` の前に出ていることから、3 でサーバーを閉じる前に 2 件とも応答を返したとわかる。最後の `Terminated` は、プロセスが SIGTERM で終了したことを示すシェルの表示で、5 で送り直したシグナルによる。終了コードは 143（128 + 15）になる。
 
 `/sleep` は中断を受け付けないため、3 で sleep の完了を待ってから終了する。
+
+`/cpu-heavy-blocking` は同期的なループでメインスレッドを占有するため、ループ中に届いた SIGTERM のハンドラを実行できない。ループが終わって 200 を返した後に、1 から順に終了処理を行う。
+
+`/cpu-heavy` の `worker.terminate()` は Worker 内の JavaScript を打ち切るため、Worker 内で後始末を実行できない（`process.on('exit')` も呼ばない）。`/cpu-heavy-cooperative` は `SharedArrayBuffer` の中断フラグで Worker に中断を通知し、Worker がループを抜けて後始末を行う。1 秒以内に終わらなければ `terminate()` で強制終了する。
